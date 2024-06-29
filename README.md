@@ -12,7 +12,7 @@ xmpad can be configured to emit custom keypresses for each button - change these
 
 * Red button: Exit - Ctrl+Alt+F12
 * Front left: Audio on/off - Ctrl+Alt+F10
-* Front right: Audio on/off - Ctrl+Alt+F11
+* Front right: Video on/off - Ctrl+Alt+F11
 * Middle left: Window switch - Alt+Tab
 * Middle centre: Close window - Alt+F4
 * Middle right: Enter
