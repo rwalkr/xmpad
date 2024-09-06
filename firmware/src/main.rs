@@ -5,13 +5,14 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{AnyPin, Input, Pull};
 use embassy_rp::peripherals::{PIO0, USB};
 use embassy_rp::{pio, usb};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::{Channel, Receiver, Sender};
-use embassy_time::{Duration, Ticker};
+use embassy_time::{block_for, Duration, Instant, Ticker, Timer};
 use embassy_usb::class::hid::{
     self, HidReader, HidReaderWriter, HidWriter, ReportId, RequestHandler, State,
 };
@@ -23,6 +24,7 @@ use usbd_human_interface_device::{
     device::keyboard::{BootKeyboardReport, BOOT_KEYBOARD_REPORT_DESCRIPTOR},
     page::Keyboard,
 };
+use heapless::Vec;
 
 use {defmt_rtt as _, panic_probe as _};
 
@@ -30,21 +32,44 @@ type KbdHidReaderWriter<'a> = HidReaderWriter<'a, usb::Driver<'a, USB>, 1, 25>;
 type KbdHidReader<'a> = HidReader<'a, usb::Driver<'a, USB>, 1>;
 type KbdHidWriter<'a> = HidWriter<'a, usb::Driver<'a, USB>, 25>;
 
-type KbdReportQueue = Channel<ThreadModeRawMutex, Keycodes, 4>;
+#[derive(PartialEq)]
+enum KbdEvent {
+    Press,
+    Release
+}
 
-type KeyEvents = [Keyboard; 3];
-const NK: Keyboard = Keyboard::NoEventIndicated;
+type KbdEventQueue = Channel<ThreadModeRawMutex, KbdEvent, 4>;
+type KbdEventQueueSender<'a> = Sender<'a, ThreadModeRawMutex, KbdEvent, 4>;
+type KbdEventQueueReceiver<'a> = Receiver<'a, ThreadModeRawMutex, KbdEvent, 4>;
+type KbdReportQueue = Channel<ThreadModeRawMutex, Keycodes, 4>;
+type KbdReportQueueSender<'a> = Sender<'a, ThreadModeRawMutex, Keycodes, 4>;
+type KbdReportQueueReceiver<'a> = Receiver<'a, ThreadModeRawMutex, Keycodes, 4>;
+
+mod modifiers {
+    pub const SHIFT: u32 = 1;
+    pub const CTRL: u32 = 2;
+    pub const ALT: u32 = 4;
+    pub const GUI: u32 = 8;
+}
+type Modifiers = u32;
+
+enum KeyAction {
+    Simple{ key: Keyboard, m: Modifiers },
+    StickyModifiers{ key: Keyboard, m: Modifiers, pre_delay: u64, release_delay: u64 }
+}
 
 const KEY_COUNT: usize = 6;
-const KEY_CODES: [KeyEvents; KEY_COUNT] = [
-    [Keyboard::LeftAlt, Keyboard::LeftControl, Keyboard::F12], // Stop
-    [Keyboard::LeftAlt, Keyboard::Tab, NK], // 1L
-    [Keyboard::LeftAlt, Keyboard::F4, NK], // 1M
-    [Keyboard::ReturnEnter, NK, NK],            // 1R,
-    [Keyboard::LeftAlt, Keyboard::LeftControl, Keyboard::F10], // 2L
-    [Keyboard::LeftAlt, Keyboard::LeftControl, Keyboard::F11], // 2R
+const KEY_ACTIONS: [KeyAction; KEY_COUNT] = [
+    KeyAction::Simple { key: Keyboard::F12, m: modifiers::CTRL | modifiers::ALT },
+    KeyAction::StickyModifiers { key: Keyboard::Tab, m:  modifiers::ALT, pre_delay: 0, release_delay: 500 },
+    KeyAction::StickyModifiers { key: Keyboard::P, m: modifiers::GUI, pre_delay: 50, release_delay: 1000 },
+    KeyAction::Simple { key: Keyboard::ReturnEnter, m: 0 },
+    KeyAction::Simple { key: Keyboard::F10, m: modifiers::CTRL | modifiers::ALT },
+    KeyAction::Simple { key: Keyboard::F11, m: modifiers::CTRL | modifiers::ALT },
 ];
-type Keycodes = heapless::Vec<Keyboard, KEY_COUNT>;
+
+const MAX_KEYS: usize = KEY_COUNT + 4;
+type Keycodes = Vec<Keyboard, MAX_KEYS>;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
@@ -117,13 +142,23 @@ async fn main(spawner: Spawner) {
         max_packet_size: 64,
     };
     let kbd_hid = KbdHidReaderWriter::new(&mut builder, kbd_hid_state, kbd_hid_config);
+    let (kbd_hid_reader, kbd_hid_writer) = kbd_hid.split();
+
+    static KBD_EVENT_QUEUE: StaticCell<Vec<KbdEventQueue, KEY_COUNT>> = StaticCell::new();
+    let kbd_event_queue = KBD_EVENT_QUEUE.init((0..KEY_COUNT).map(|_| Channel::new()).collect());
+    let kbd_event_senders: Vec<KbdEventQueueSender, KEY_COUNT> = kbd_event_queue.iter().map(|q| q.sender()).collect();
+    let kbd_event_receivers: Vec<KbdEventQueueReceiver, KEY_COUNT> = kbd_event_queue.iter().map(|q| q.receiver()).collect();
 
     static KBD_REPORT_QUEUE: StaticCell<KbdReportQueue> = StaticCell::new();
     let kbd_report_queue = KBD_REPORT_QUEUE.init(Channel::new());
+    let kbd_report_sender = kbd_report_queue.sender();
+    let kbd_report_receiver = kbd_report_queue.receiver();
 
-    let (kbd_hid_reader, kbd_hid_writer) = kbd_hid.split();
-    spawner.must_spawn(kbd_scan(key_pins, kbd_report_queue.sender()));
-    spawner.must_spawn(kbd_hid_write(kbd_report_queue.receiver(), kbd_hid_writer));
+    spawner.must_spawn(kbd_scan(key_pins, kbd_event_senders));
+    for i in 0..KEY_COUNT {
+        spawner.must_spawn(kbd_key_handler(&KEY_ACTIONS[i], kbd_event_receivers[i], kbd_report_sender));
+    }
+    spawner.must_spawn(kbd_hid_write(kbd_report_receiver, kbd_hid_writer));
     spawner.must_spawn(kbd_hid_read(kbd_hid_reader, kbd_handler));
 
     let mut usb = builder.build();
@@ -162,7 +197,7 @@ impl KeyboardHandler {
 #[embassy_executor::task]
 async fn kbd_scan(
     key_pins: [Input<'static, AnyPin>; KEY_COUNT],
-    kbd_report_queue: Sender<'static, ThreadModeRawMutex, Keycodes, 4>,
+    kbd_event_queues: Vec<KbdEventQueueSender<'static>, KEY_COUNT>
 ) {
     let mut ticker = Ticker::every(Duration::from_millis(1));
     const DEBOUNCE_TICKS: usize = 5;
@@ -172,7 +207,6 @@ async fn kbd_scan(
     let mut key_states = [false; KEY_COUNT];
     loop {
         // read pins and update states
-        let mut key_changed = false;
         for p in 0..KEY_COUNT {
             let cur_state = key_pins[p].is_low();
             if pin_states[p] != cur_state {
@@ -186,33 +220,150 @@ async fn kbd_scan(
                     // steady state - update key state
                     info!("kbd_scan: Detected pin {}: {}", p, pin_states[p]);
                     key_states[p] = pin_states[p];
-                    key_changed = true;
+                    let ev = if pin_states[p] {
+                        KbdEvent::Press
+                    } else  {
+                        KbdEvent::Release
+                    };
+                    kbd_event_queues[p].send(ev).await;
                 }
             }
-        }
-
-        // send report
-        if key_changed {
-            let mut keycodes = Keycodes::new();
-            for (i, p) in key_states.iter().enumerate() {
-                if *p {
-                    for k in KEY_CODES[i] {
-                        keycodes.push(k).unwrap_or_default();
-                    }
-                }
-            }
-
-            info!("kbd_scan: report {}", keycodes.len());
-            kbd_report_queue.send(keycodes.clone()).await;
         }
 
         ticker.next().await;
     }
 }
 
+async fn wait_for_press(kbd_event_queue: &KbdEventQueueReceiver<'static>) {
+    loop {
+        let ev = kbd_event_queue.receive().await;
+        if ev == KbdEvent::Press {
+            break
+        }
+    }
+}
+
+async fn wait_for_release(kbd_event_queue: &KbdEventQueueReceiver<'static>) {
+    loop {
+        let ev = kbd_event_queue.receive().await;
+        if ev == KbdEvent::Release {
+            break
+        }
+    }
+}
+
+fn apply_modifiers(keycodes: &mut Keycodes, m: &Modifiers) {
+    if m & modifiers::SHIFT != 0 {
+        keycodes.push(Keyboard::LeftShift).unwrap()
+    }
+    if m & modifiers::CTRL != 0 {
+        keycodes.push(Keyboard::LeftControl).unwrap()
+    }
+    if m & modifiers::ALT != 0 {
+        keycodes.push(Keyboard::LeftAlt).unwrap()
+    }
+    if m & modifiers::GUI != 0 {
+        keycodes.push(Keyboard::LeftGUI).unwrap()
+    }
+}
+
+#[embassy_executor::task(pool_size = KEY_COUNT)]
+async fn kbd_key_handler(
+    kbd_action: &'static KeyAction,
+    kbd_event_queue: KbdEventQueueReceiver<'static>,
+    kbd_report_queue: KbdReportQueueSender<'static>,
+) {
+    match kbd_action {
+        KeyAction::Simple{ key, m } => simple_key_handler(key, m, kbd_event_queue, kbd_report_queue).await,
+        KeyAction::StickyModifiers { key, m, pre_delay, release_delay } => sticky_mod_key_handler(key, m, pre_delay, release_delay, kbd_event_queue, kbd_report_queue).await,
+    }
+}
+
+async fn simple_key_handler(
+    key: &Keyboard,
+    m: &Modifiers,
+    kbd_event_queue: KbdEventQueueReceiver<'static>,
+    kbd_report_queue: KbdReportQueueSender<'static>,
+) {
+    loop {
+        info!("kbd_state: Waiting for press");
+        wait_for_press(&kbd_event_queue).await;
+
+        // send key and modifiers
+        let mut keycodes = Keycodes::new();
+        keycodes.push(*key).unwrap_or_default();
+        apply_modifiers(&mut keycodes, m);
+        kbd_report_queue.send(keycodes).await;
+
+        info!("kbd_state: Waiting for release");
+        wait_for_release(&kbd_event_queue).await;
+
+        // send empty key set
+        kbd_report_queue.send(Keycodes::new()).await;
+    }
+}
+
+async fn sticky_mod_key_handler(
+    key: &Keyboard,
+    m: &Modifiers,
+    pre_delay: &u64,
+    release_delay: &u64,
+    kbd_event_queue: KbdEventQueueReceiver<'static>,
+    kbd_report_queue: KbdReportQueueSender<'static>,
+) {
+    let mut mods_held_until = Instant::MAX;
+    loop {
+        info!("kbd_state: Waiting for press");
+        loop {
+            let timeout = Timer::at(mods_held_until);
+            let ev = select(kbd_event_queue.receive(), timeout).await;
+            match ev {
+                Either::First(KbdEvent::Press) => {
+                    break
+                }
+                Either::First(KbdEvent::Release) => {
+                    // spurious release - keep waiting
+                }
+                Either::Second(_) => {
+                    // deadline elapsed:
+                    // send empty keycodes to release mods
+                    kbd_report_queue.send(Keycodes::new()).await;
+                    mods_held_until = Instant::MAX;
+                    // continue waiting
+                }
+            }
+        }
+
+        let mut keycodes = Keycodes::new();
+        apply_modifiers(&mut keycodes, m);
+
+        // maybe send modifiers early
+        if keycodes.len() > 0 && *pre_delay > 0 {
+            kbd_report_queue.send(keycodes.clone()).await;
+            block_for(Duration::from_millis(*pre_delay));
+        }
+
+        // send the key
+        keycodes.push(*key).unwrap_or_default();
+        kbd_report_queue.send(keycodes.clone()).await;
+
+        info!("kbd_state: Waiting for release");
+        wait_for_release(&kbd_event_queue).await;
+
+        keycodes = Keycodes::new();
+        if *release_delay > 0 {
+            apply_modifiers(&mut keycodes, m);
+            mods_held_until = Instant::now() + Duration::from_millis(*release_delay);
+        } else {
+            mods_held_until = Instant::MAX;
+        }
+        kbd_report_queue.send(keycodes.clone()).await;
+    }
+}
+
 #[embassy_executor::task]
 async fn kbd_hid_write(
-    kbd_report_queue: Receiver<'static, ThreadModeRawMutex, Keycodes, 4>,
+    kbd_report_queue: KbdReportQueueReceiver<'static>,
     mut kbd_writer: KbdHidWriter<'static>,
 ) {
     loop {
