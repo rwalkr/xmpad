@@ -60,15 +60,12 @@ enum KeyAction {
 
 const KEY_COUNT: usize = 6;
 const KEY_ACTIONS: [KeyAction; KEY_COUNT] = [
-    // Red button - exit meeting
-    KeyAction::Simple { key: Keyboard::H, m: modifiers::CTRL | modifiers::SHIFT },
-    // Middle row - switch window, switch display config, enter
+    KeyAction::Simple { key: Keyboard::F12, m: modifiers::CTRL | modifiers::ALT },
     KeyAction::StickyModifiers { key: Keyboard::Tab, m:  modifiers::ALT, pre_delay: 0, release_delay: 500 },
     KeyAction::StickyModifiers { key: Keyboard::P, m: modifiers::GUI, pre_delay: 50, release_delay: 1000 },
     KeyAction::Simple { key: Keyboard::ReturnEnter, m: 0 },
-    // Bottomn row - mute, video toggle
-    KeyAction::Simple { key: Keyboard::M, m: modifiers::CTRL | modifiers::SHIFT },
-    KeyAction::Simple { key: Keyboard::O, m: modifiers::CTRL | modifiers::SHIFT },
+    KeyAction::Simple { key: Keyboard::F10, m: modifiers::CTRL | modifiers::ALT },
+    KeyAction::Simple { key: Keyboard::F11, m: modifiers::CTRL | modifiers::ALT },
 ];
 
 const MAX_KEYS: usize = KEY_COUNT + 4;
