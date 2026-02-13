@@ -7,7 +7,7 @@ use defmt::*;
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
 use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{AnyPin, Input, Pull};
+use embassy_rp::gpio::{Input, Pull};
 use embassy_rp::peripherals::{PIO0, USB};
 use embassy_rp::{pio, usb};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
@@ -81,13 +81,13 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     let usb_driver = usb::Driver::new(p.USB, Irqs);
 
-    let key_pins: [Input<AnyPin>; KEY_COUNT] = [
-        Input::new(AnyPin::from(p.PIN_2), Pull::Up),
-        Input::new(AnyPin::from(p.PIN_3), Pull::Up),
-        Input::new(AnyPin::from(p.PIN_4), Pull::Up),
-        Input::new(AnyPin::from(p.PIN_5), Pull::Up),
-        Input::new(AnyPin::from(p.PIN_6), Pull::Up),
-        Input::new(AnyPin::from(p.PIN_7), Pull::Up),
+    let key_pins: [Input; KEY_COUNT] = [
+        Input::new(p.PIN_2, Pull::Up),
+        Input::new(p.PIN_3, Pull::Up),
+        Input::new(p.PIN_4, Pull::Up),
+        Input::new(p.PIN_5, Pull::Up),
+        Input::new(p.PIN_6, Pull::Up),
+        Input::new(p.PIN_7, Pull::Up),
     ];
 
     // Create embassy-usb Config
@@ -103,8 +103,6 @@ async fn main(spawner: Spawner) {
 
     // Create embassy-usb DeviceBuilder using the driver and config.
     // It needs some buffers for building the descriptors.
-    static DEVICE_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
-    let device_descriptor = DEVICE_DESCRIPTOR.init([0; 256]);
     static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
     let config_descriptor = CONFIG_DESCRIPTOR.init([0; 256]);
     static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
@@ -126,7 +124,6 @@ async fn main(spawner: Spawner) {
     let mut builder = Builder::new(
         usb_driver,
         config,
-        device_descriptor,
         config_descriptor,
         bos_descriptor,
         msos_descriptor,
@@ -137,7 +134,7 @@ async fn main(spawner: Spawner) {
     // Create classes on the builder.
     let kbd_hid_config = hid::Config {
         report_descriptor: BOOT_KEYBOARD_REPORT_DESCRIPTOR,
-        request_handler: Some(kbd_handler),
+        request_handler: None,
         poll_ms: 60,
         max_packet_size: 64,
     };
@@ -168,21 +165,21 @@ async fn main(spawner: Spawner) {
 struct KeyboardHandler {}
 
 impl RequestHandler for KeyboardHandler {
-    fn get_report(&self, id: ReportId, _buf: &mut [u8]) -> Option<usize> {
+    fn get_report(&mut self, id: ReportId, _buf: &mut [u8]) -> Option<usize> {
         info!("Get report for {:?}", id);
         None
     }
 
-    fn set_report(&self, id: ReportId, data: &[u8]) -> OutResponse {
+    fn set_report(&mut self, id: ReportId, data: &[u8]) -> OutResponse {
         info!("Set report for {:?}: {=[u8]}", id, data);
         OutResponse::Accepted
     }
 
-    fn set_idle_ms(&self, id: Option<ReportId>, dur: u32) {
+    fn set_idle_ms(&mut self, id: Option<ReportId>, dur: u32) {
         info!("Set idle rate for {:?} to {:?}", id, dur);
     }
 
-    fn get_idle_ms(&self, id: Option<ReportId>) -> Option<u32> {
+    fn get_idle_ms(&mut self, id: Option<ReportId>) -> Option<u32> {
         info!("Get idle rate for {:?}", id);
         None
     }
@@ -196,7 +193,7 @@ impl KeyboardHandler {
 
 #[embassy_executor::task]
 async fn kbd_scan(
-    key_pins: [Input<'static, AnyPin>; KEY_COUNT],
+    key_pins: [Input<'static>; KEY_COUNT],
     kbd_event_queues: Vec<KbdEventQueueSender<'static>, KEY_COUNT>
 ) {
     let mut ticker = Ticker::every(Duration::from_millis(1));
@@ -382,7 +379,7 @@ async fn kbd_hid_write(
 #[embassy_executor::task]
 async fn kbd_hid_read(
     kbd_hid_reader: KbdHidReader<'static>,
-    kbd_handler: &'static KeyboardHandler,
+    kbd_handler: &'static mut KeyboardHandler,
 ) {
     kbd_hid_reader.run(false, kbd_handler).await;
 }
