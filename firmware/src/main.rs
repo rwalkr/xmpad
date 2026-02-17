@@ -8,8 +8,9 @@ use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Input, Pull};
-use embassy_rp::peripherals::{PIO0, USB};
-use embassy_rp::{pio, usb};
+use embassy_rp::peripherals::{PIO0, USB, I2C0};
+use embassy_rp::{i2c, pio, usb};
+use embedded_hal::i2c::I2c;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::{Channel, Receiver, Sender};
 use embassy_time::{block_for, Duration, Instant, Ticker, Timer};
@@ -20,6 +21,7 @@ use embassy_usb::control::OutResponse;
 use embassy_usb::{Builder, Config, Handler};
 use packed_struct::prelude::*;
 use static_cell::StaticCell;
+use usbd_human_interface_device::device::mouse::{WHEEL_MOUSE_REPORT_DESCRIPTOR, WheelMouseReport};
 use usbd_human_interface_device::{
     device::keyboard::{BootKeyboardReport, BOOT_KEYBOARD_REPORT_DESCRIPTOR},
     page::Keyboard,
@@ -31,6 +33,7 @@ use {defmt_rtt as _, panic_probe as _};
 type KbdHidReaderWriter<'a> = HidReaderWriter<'a, usb::Driver<'a, USB>, 1, 25>;
 type KbdHidReader<'a> = HidReader<'a, usb::Driver<'a, USB>, 1>;
 type KbdHidWriter<'a> = HidWriter<'a, usb::Driver<'a, USB>, 25>;
+type MouseHidWriter<'a> = HidWriter<'a, usb::Driver<'a, USB>, 5>;
 
 #[derive(PartialEq)]
 enum KbdEvent {
@@ -44,6 +47,9 @@ type KbdEventQueueReceiver<'a> = Receiver<'a, ThreadModeRawMutex, KbdEvent, 4>;
 type KbdReportQueue = Channel<ThreadModeRawMutex, Keycodes, 4>;
 type KbdReportQueueSender<'a> = Sender<'a, ThreadModeRawMutex, Keycodes, 4>;
 type KbdReportQueueReceiver<'a> = Receiver<'a, ThreadModeRawMutex, Keycodes, 4>;
+type MouseReportQueue = Channel<ThreadModeRawMutex, WheelMouseReport, 4>;
+type MouseReportQueueSender<'a> = Sender<'a, ThreadModeRawMutex, WheelMouseReport, 4>;
+type MouseReportQueueReceiver<'a> = Receiver<'a, ThreadModeRawMutex, WheelMouseReport, 4>;
 
 mod modifiers {
     pub const SHIFT: u32 = 1;
@@ -90,6 +96,13 @@ async fn main(spawner: Spawner) {
         Input::new(p.PIN_7, Pull::Up),
     ];
 
+    // Configure I²C interface
+    let sda_pin = p.PIN_12;
+    let scl_pin = p.PIN_13;
+    let mut i2c_cfg = i2c::Config::default();
+    i2c_cfg.frequency = 400_000u32;
+    let i2c = i2c::I2c::new_blocking(p.I2C0, scl_pin, sda_pin, i2c_cfg);
+
     // Create embassy-usb Config
     // Test PID from https://pid.codes/1209/
     const VID: u16 = 0x1209;
@@ -121,6 +134,9 @@ async fn main(spawner: Spawner) {
     static KBD_HID_STATE: StaticCell<State> = StaticCell::new();
     let kbd_hid_state = KBD_HID_STATE.init(State::new());
 
+    static MOUSE_HID_STATE: StaticCell<State> = StaticCell::new();
+    let mouse_hid_state = MOUSE_HID_STATE.init(State::new());
+
     let mut builder = Builder::new(
         usb_driver,
         config,
@@ -141,6 +157,14 @@ async fn main(spawner: Spawner) {
     let kbd_hid = KbdHidReaderWriter::new(&mut builder, kbd_hid_state, kbd_hid_config);
     let (kbd_hid_reader, kbd_hid_writer) = kbd_hid.split();
 
+    let mouse_hid_config = hid::Config {
+        report_descriptor: WHEEL_MOUSE_REPORT_DESCRIPTOR,
+        request_handler: None,
+        poll_ms: 60,
+        max_packet_size: 64,
+    };
+    let mouse_hid = MouseHidWriter::new(&mut builder, mouse_hid_state, mouse_hid_config);
+
     static KBD_EVENT_QUEUE: StaticCell<Vec<KbdEventQueue, KEY_COUNT>> = StaticCell::new();
     let kbd_event_queue = KBD_EVENT_QUEUE.init((0..KEY_COUNT).map(|_| Channel::new()).collect());
     let kbd_event_senders: Vec<KbdEventQueueSender, KEY_COUNT> = kbd_event_queue.iter().map(|q| q.sender()).collect();
@@ -151,12 +175,20 @@ async fn main(spawner: Spawner) {
     let kbd_report_sender = kbd_report_queue.sender();
     let kbd_report_receiver = kbd_report_queue.receiver();
 
+    static MOUSE_REPORT_QUEUE: StaticCell<MouseReportQueue> = StaticCell::new();
+    let mouse_report_queue = MOUSE_REPORT_QUEUE.init(Channel::new());
+    let mouse_report_sender = mouse_report_queue.sender();
+    let mouse_report_receiver = mouse_report_queue.receiver();
+
     spawner.must_spawn(kbd_scan(key_pins, kbd_event_senders));
     for i in 0..KEY_COUNT {
         spawner.must_spawn(kbd_key_handler(&KEY_ACTIONS[i], kbd_event_receivers[i], kbd_report_sender));
     }
     spawner.must_spawn(kbd_hid_write(kbd_report_receiver, kbd_hid_writer));
     spawner.must_spawn(kbd_hid_read(kbd_hid_reader, kbd_handler));
+
+    spawner.must_spawn(scroll_wheel(i2c, mouse_report_sender));
+    spawner.must_spawn(mouse_hid_write(mouse_report_receiver, mouse_hid));
 
     let mut usb = builder.build();
     usb.run().await;
@@ -383,6 +415,104 @@ async fn kbd_hid_read(
 ) {
     kbd_hid_reader.run(false, kbd_handler).await;
 }
+
+#[derive(Clone, Debug, Default)]
+struct MouseReport(WheelMouseReport);
+
+impl MouseReport {
+    pub fn wheel(mut self, v: i8) -> Self {
+        self.0.vertical_wheel = v;
+        self
+    }
+}
+
+impl From<MouseReport> for WheelMouseReport {
+    fn from(r: MouseReport) -> Self {
+        r.0
+    }
+}
+
+fn read_reg_u8(i2c: &mut i2c::I2c<'static, I2C0, i2c::Blocking>, addr: u8, reg_num: u8) -> Result<u8, i2c::Error> {
+    let mut rd_buf = [0xA5u8; 1];
+    i2c.write_read(addr, &reg_num.to_be_bytes(), &mut rd_buf)?;
+    let r = rd_buf[0];
+    Ok(r)
+}
+
+fn read_reg_pair(i2c: &mut i2c::I2c<'static, I2C0, i2c::Blocking>, addr: u8, reg_nums: (u8, u8)) -> Result<(u8, u8), i2c::Error> {
+    let r0 = read_reg_u8(i2c, addr, reg_nums.0)?;
+    let r1 = read_reg_u8(i2c, addr, reg_nums.1)?;
+    Ok((r0, r1))
+}
+
+fn read_scroll_pos(i2c: &mut i2c::I2c<'static, I2C0, i2c::Blocking>) -> Result<u16, i2c::Error> {
+    const I2C_ADDR: u8 = 0x06;
+    let (hi, lo) = read_reg_pair(i2c, I2C_ADDR, (0x03, 0x04))?;
+    Ok(((hi as u16) << 6) | ((lo as u16) >> 2))
+}
+
+#[embassy_executor::task]
+async fn scroll_wheel(
+    mut i2c: i2c::I2c<'static, I2C0, i2c::Blocking>,
+    mouse_report_sender: MouseReportQueueSender<'static>
+) {
+    info!("Starting scroll scan");
+    let mut ticker = Ticker::every(Duration::from_millis(100));
+    const STEPS_PER_REV: i16 = 16384;
+    const STEPS_PER_SCROLL: i16 = 128;
+
+    ticker.next().await;
+
+    let mut last_pos: u16 = read_scroll_pos(&mut i2c).unwrap_or(0);
+    let mut scroll_credit: i16 = 0;
+    loop {
+        match read_scroll_pos(&mut i2c) {
+            Ok(pos) => {
+                let mut delta = (pos as i16).wrapping_sub_unsigned(last_pos);
+                if delta > STEPS_PER_REV/2 { 
+                    delta -= STEPS_PER_REV;
+                }
+                if delta < -STEPS_PER_REV/2 {
+                    delta += STEPS_PER_REV;
+                }
+
+                last_pos = pos;
+
+                scroll_credit += delta as i16;
+                let scroll = scroll_credit / STEPS_PER_SCROLL;
+                scroll_credit -= scroll * STEPS_PER_SCROLL;
+                if scroll != 0 {
+                    mouse_report_sender.send(MouseReport::default().wheel(scroll as i8).into()).await;
+                }
+
+                info!("V = {} :: {} => {}", pos, delta, scroll);
+            }
+            Err(e) => {
+                warn!("I2C read failed: {:?}", e);
+            }
+        }
+
+        ticker.next().await;
+    }
+}
+
+#[embassy_executor::task]
+async fn mouse_hid_write(
+    mouse_report_queue: MouseReportQueueReceiver<'static>,
+    mut mouse_writer: MouseHidWriter<'static>,
+) {
+    loop {
+        info!("mouse hid_writer: Waiting for event");
+        let report = mouse_report_queue.receive().await;
+
+        info!("hid_writer: Sending report");
+        match mouse_writer.write(&report.pack().unwrap()).await {
+            Ok(()) => {}
+            Err(e) => warn!("Failed to send report: {:?}", e),
+        };
+    }
+}
+
 
 struct USBDeviceHandler {
     configured: AtomicBool,
